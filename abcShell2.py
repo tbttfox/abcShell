@@ -74,7 +74,6 @@ def createRawObject(name, counts, verts, faces, uvs=None, uvFaces=None):
     return dup
 
 
-
 # NUMPY ONLY
 def _dot(a, b):
     """A much faster dot-product
@@ -197,7 +196,8 @@ def findBorderEdges(counts, faces):
         faces (np.array): The flattened indices of each vert
 
     Returns:
-        np.array: An Nx2 numpy array of edge pairs
+        np.array: An Nx2 numpy array of edge pairs in proper
+            face order.
 
     """
     nextStep = np.arange(len(faces)) + 1
@@ -226,6 +226,47 @@ def findBorderEdges(counts, faces):
     _, inv, ct = np.unique(crazyArray, return_inverse=True, return_counts=True)
     ret = edges[ct[inv] == 1]
     return ret[np.argsort(ret[:, 0])]
+
+
+def sortBorderEdgesByTriangle(bEdges, tris):
+    """The 3dsMax shell modifier orders its border edges in FaceIdx order
+    Then it uses the counter-clockwise-most vertex of each edge to bridge
+    the inner and outer panels.
+
+    So, I've gotta sort my border edges in the same way as Max does
+
+    Also, max works in *triangles* ... I may be able to ignore that, but for
+    now, I'm saying it's gotta be triangulated
+
+    Arguments:
+        bEdges(np.array): An Nx2 array of vertex indices defining border edges
+            These edges must be in the correct order so they match the tris
+            they belong to
+        tris (np.array): An Nx3 array of vertex indices defining the faces
+            of a mesh
+
+    Returns:
+        np.array: The face-index sorted border edge pair array
+    """
+    # build a numerical type that is "pairs of integers"
+    pairType = np.dtype((np.void, bEdges.dtype.itemsize * 2))
+
+    # Convert the borders to this "Pairs" type
+    bCols = np.ascontiguousarray(bEdges).view(pairType).flatten()
+
+    edgeCols = np.zeros(tris.shape, dtype=pairType)
+    for i in range(3):
+        # For each set of adjacent verts around all triangles
+        # convert the pair to this "Pairs" type so I can find
+        # all border pairs and their indices
+        tc = np.ascontiguousarray(tris[:, (i, (i + 1) % 3)])
+        edgeCols[:, i] = tc.view(pairType).flatten()
+
+    edgeCols = edgeCols.flatten()
+    # Now find all the border edges
+    sorter = np.argsort(edgeCols)
+    idxsOf = sorter[np.searchsorted(edgeCols, bCols, sorter=sorter)]
+    return bEdges[np.argsort(idxsOf)]
 
 
 def buildBorderConnections(edges, offset, flip):
@@ -282,119 +323,84 @@ def reverseFaces(counts, faces):
     return faces[idAry.cumsum()]
 
 
-def opposingEdges(counts, faces, stars=False):
-    """Find the opposite edge around each vertex
+def shell(anim, faces, counts):
+    tris = _triangulate(counts, faces)
+    tCounts = np.ones(len(tris), dtype=int) * 3
+    tFaces = tris.flatten()
 
-    Arguments:
-        counts (np.array): The number of verts per face
-        faces (np.array): The flattened indices of each vert
-        stars (bool): Whether to handle high-valence vertices
-            ie. Vertices with an even number > 4 of neighbors
+    # in 3dsMax, the Inner shell gets the higher vertIdxs
+    # Then the bridge between gets the highest
+    # And the bridge loop indices increase from O to I
 
-    returns:
-        ???: Not quite sure yet
-    """
-    # I'm not sure whether to return a mapping of edges
-    # or vertices... I can get the data, but packing it for
-    # easy use is difficult
-    pass
+    innerOffset = 0.1
+    outerOffset = 0.1
+    numBridgeLoops = 3
 
+    norms = buildNormals(anim, tCounts, tFaces, triangulate=False)
 
+    oAnim = anim + (outerOffset * norms)
+    iAnim = anim - (innerOffset * norms)
 
-def getEdgeLoops(edges, counts, faces):
-    """Get the (ordered) loops containing each given edge pair
+    oCounts = counts
+    iCounts = counts
 
-    Arguments:
-        edges (np.array): An Nx2 array of vertex pairs that define edges
-        counts (np.array): The number of verts per face
-        faces (np.array): The flattened indices of each vert
+    oFaces = faces
+    iFaces = faces.copy() + anim.shape[1]
+    iFaces = reverseFaces(iCounts, iFaces)
 
-    returns:
-        list: A list of np.arrays of loops
-    """
-    opps = opposingEdges(counts, faces)
+    counts = np.concatenate((oCounts, iCounts))
+    faces = np.concatenate((oFaces, iFaces))
+    anim = np.concatenate((oAnim, iAnim), axis=-2)
 
 
+    obEdges = findBorderEdges(oCounts, oFaces)
+    obEdges = sortBorderEdgesByTriangle(obEdges, tris)
+    ibEdges = np.flip(obEdges + iAnim.shape[1], axis=1)
+
+    obVerts = obEdges[:, 1]
+    ibVerts = obVerts + iAnim.shape[1]
 
 
-
-counts, verts, faces, uvs, uvFaces = getMeshDesc('Panel')
-
-# tris = _triangulate(counts, faces)
-# counts = np.ones(len(tris), dtype=int) * 3
-# faces = tris.flatten()
+    sorter = np.argsort(obEdges[:, 0])
+    backCycle = sorter[np.searchsorted(obEdges[:, 0], obEdges[:, 1], sorter=sorter)]
+    cycle = np.empty(backCycle.shape, dtype=int)
+    cycle[backCycle] = np.arange(len(backCycle))
 
 
-# in 3dsMax, the Inner shell gets the higher vertIdxs
-# Then the bridge between gets the highest
-# And the bridge loop indices increase from O to I
+    bvCount = len(obVerts)
+    bvStart = anim.shape[1]
+    curEdges = obEdges[:, 1]
+    newFaces, newVerts = [], []
+    for i in range(numBridgeLoops):
+        v1 = curEdges
+        v2 = np.arange(bvCount, dtype=int) + bvStart + (i * bvCount)
+        v3 = v2[cycle]
+        v4 = v1[cycle]
 
-innerOffset = 0.1
-outerOffset = 0.1
-numBridgeLoops = 1
-anim = verts[None, ...]
+        newFaces.append(np.stack((v1, v2, v3, v4), axis=1).flatten())
+        curEdges = v2
 
+        perc = (i + 1.0) / (numBridgeLoops + 1.0)
 
-norms = buildNormals(anim, counts, faces, triangulate=False)
+        newVerts.append(anim[:, obVerts] * (1 - perc) + anim[:, ibVerts] * perc)
 
-
-oAnim = anim + (outerOffset * norms)
-iAnim = anim - (innerOffset * norms)
-
-oCounts = counts
-iCounts = counts
-
-oFaces = faces
-iFaces = faces.copy() + anim.shape[1]
-iFaces = reverseFaces(iCounts, iFaces)
-
-counts = np.concatenate((oCounts, iCounts))
-faces = np.concatenate((oFaces, iFaces))
-anim = np.concatenate((oAnim, iAnim), axis=-2)
-
-
-obEdges = findBorderEdges(oCounts, oFaces)
-ibEdges = np.flip(obEdges + iAnim.shape[1], axis=1)
-
-obVerts = np.unique(obEdges.flatten())
-ibVerts = obVerts + iAnim.shape[1]
-
-bvCount = len(obVerts)
-bvStart = anim.shape[1]
-
-backCycle = np.argsort(obEdges[:, 1])
-cycle = np.empty(backCycle.shape, dtype=int)
-cycle[backCycle] = np.arange(len(backCycle))
-
-
-curEdges = obEdges[:, 0]
-newFaces, newVerts = [], []
-for i in range(numBridgeLoops):
     v1 = curEdges
-    v2 = np.arange(bvCount, dtype=int) + bvStart + (i * bvCount)
+    v2 = ibEdges[:, 0]
     v3 = v2[cycle]
     v4 = v1[cycle]
-
     newFaces.append(np.stack((v1, v2, v3, v4), axis=1).flatten())
-    curEdges = v2
+    newCounts = np.ones((numBridgeLoops + 1) * bvCount, dtype=int) * 4
 
-    perc = (i + 1.0) / (numBridgeLoops + 1.0)
+    anim = np.concatenate([anim] + newVerts, axis=-2)
+    faces = np.concatenate([faces] + newFaces)
+    counts = np.concatenate((counts, newCounts))
 
-    newVerts.append(anim[:, obVerts] * (1 - perc) + anim[:, ibVerts] * perc)
-
-
-v1 = curEdges
-v2 = ibEdges[:, 1]
-v3 = v2[cycle]
-v4 = v1[cycle]
-newFaces.append(np.stack((v1, v2, v3, v4), axis=1).flatten())
-newCounts = np.ones((numBridgeLoops + 1) * bvCount, dtype=int) * 4
+    return anim, faces, counts
 
 
-anim = np.concatenate([anim] + newVerts, axis=-2)
-faces = np.concatenate([faces] + newFaces)
-counts = np.concatenate((counts, newCounts))
+if __name__ == "__main__":
+    counts, verts, faces, uvs, uvFaces = getMeshDesc('quadPanel')
+    anim, faces, counts = shell(verts[None, ...], faces, counts)
+    raw = createRawObject("test", counts, anim[0], faces)
 
 
-raw = createRawObject("test", counts, anim[0], faces)
-cmds.setAttr(raw + '.rotateX', -90)
